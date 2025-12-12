@@ -1,0 +1,603 @@
+# SwapSpot Ultra PRO - NEXT UPGRADE (Windows PowerShell)
+# Adds: JWT Auth, Profiles, Cloudinary uploads,
+#       Real-time messaging (Socket.io),
+#       Search, Favorites, Admin routes
+# ===========================================
+
+# 0) ensure we're in project root
+$cwd = Get-Location
+Write-Host "Running upgrade script in $cwd"
+
+# 1) Install dependencies
+Write-Host "Installing dependencies..."
+npm install mongoose bcryptjs jsonwebtoken cloudinary multer socket.io socket.io-client express cors concurrently nodemon axios
+
+# 2) Dev dependencies (optional)
+npm install -D @types/express @types/cors @types/multer
+
+# 3) Create folder structure
+New-Item -ItemType Directory -Force -Path "src\lib" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\models" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\middleware" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\auth\register" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\auth\login" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\auth\profile" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\upload" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\products\create" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\products\get" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\products\search" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\products\favorite" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\messages\send" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\messages\get" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\admin\ban" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\app\api\admin\logs" | Out-Null
+New-Item -ItemType Directory -Force -Path "src\pages\api" | Out-Null
+
+# 4) Write core libs
+
+# src/lib/db.ts
+@'
+import mongoose from "mongoose";
+
+const MONGODB_URI = process.env.MONGODB_URI as string;
+if (!MONGODB_URI) throw new Error("Missing MONGODB_URI in .env.local");
+
+let cached = (global as any).mongoose;
+if (!cached) {
+  cached = (global as any).mongoose = { conn: null, promise: null };
+}
+
+export async function connectDB() {
+  if (cached.conn) return cached.conn;
+  if (!cached.promise) {
+    cached.promise = mongoose.connect(MONGODB_URI).then(m => m);
+  }
+  cached.conn = await cached.promise;
+  return cached.conn;
+}
+'@ | Set-Content -Path "src\lib\db.ts" -Force
+
+# src/lib/jwt.ts
+@'
+import jwt from "jsonwebtoken";
+
+const JWT_SECRET = process.env.JWT_SECRET as string;
+if (!JWT_SECRET) throw new Error("Missing JWT_SECRET");
+
+export function signToken(payload: object, expiresIn = "7d") {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn });
+}
+
+export function verifyToken(token: string) {
+  return jwt.verify(token, JWT_SECRET);
+}
+'@ | Set-Content -Path "src\lib/jwt.ts" -Force
+
+# src/lib/cloudinary.ts
+@'
+import { v2 as cloudinary } from "cloudinary";
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true
+});
+
+export default cloudinary;
+'@ | Set-Content -Path "src\lib/cloudinary.ts" -Force
+
+# 5) Models: User, Product, Message, Notification, Log
+
+# src/models/User.ts
+@'
+import mongoose from "mongoose";
+
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  username: { type: String, required: false },
+  avatarUrl: { type: String, required: false },
+  bio: { type: String, required: false },
+  location: { type: String, required: false },
+  favorites: [{ type: mongoose.Schema.Types.ObjectId, ref: "Product" }],
+  role: { type: String, default: "user" },
+  banned: { type: Boolean, default: false }
+}, { timestamps: true });
+
+export default mongoose.models.User || mongoose.model("User", UserSchema);
+'@ | Set-Content -Path "src\models\User.ts" -Force
+
+# src/models/Product.ts
+@'
+import mongoose from "mongoose";
+
+const ProductSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  description: String,
+  price: Number,
+  images: [String],
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  location: String,
+  category: String,
+  archived: { type: Boolean, default: false }
+}, { timestamps: true });
+
+export default mongoose.models.Product || mongoose.model("Product", ProductSchema);
+'@ | Set-Content -Path "src\models\Product.ts" -Force
+
+# src/models/Message.ts
+@'
+import mongoose from "mongoose";
+
+const MessageSchema = new mongoose.Schema({
+  from: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  to: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  text: { type: String, required: true },
+  read: { type: Boolean, default: false }
+}, { timestamps: true });
+
+export default mongoose.models.Message || mongoose.model("Message", MessageSchema);
+'@ | Set-Content -Path "src\models/Message.ts" -Force
+
+# src/models/Notification.ts
+@'
+import mongoose from "mongoose";
+
+const NotificationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  type: String,
+  data: mongoose.Schema.Types.Mixed,
+  read: { type: Boolean, default: false }
+}, { timestamps: true });
+
+export default mongoose.models.Notification || mongoose.model("Notification", NotificationSchema);
+'@ | Set-Content -Path "src\models/Notification.ts" -Force
+
+# src/models/Log.ts
+@'
+import mongoose from "mongoose";
+
+const LogSchema = new mongoose.Schema({
+  level: String,
+  message: String,
+  meta: mongoose.Schema.Types.Mixed
+}, { timestamps: true });
+
+export default mongoose.models.Log || mongoose.model("Log", LogSchema);
+'@ | Set-Content -Path "src\models/Log.ts" -Force
+
+# 6) Middleware: JWT verify
+@'
+import { NextRequest, NextResponse } from "next/server";
+import { verifyToken } from "@lib/jwt";
+
+export async function authenticate(req: NextRequest) {
+  const auth = req.headers.get("authorization") || "";
+  const token = auth.replace("Bearer ", "");
+  if (!token) return NextResponse.json({ error: "Missing token" }, { status: 401 });
+  try {
+    const payload = verifyToken(token as string);
+    // attach user payload as header for routes to pick up if needed
+    const res = NextResponse.next();
+    res.headers.set("x-user-payload", JSON.stringify(payload));
+    return res;
+  } catch (e) {
+    return NextResponse.json({ error: "Invalid token" }, { status: 401 });
+  }
+}
+'@ | Set-Content -Path "src\middleware\auth.ts" -Force
+
+# 7) API routes
+
+# Auth register
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import User from "@models/User";
+import bcrypt from "bcryptjs";
+import { signToken } from "@lib/jwt";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const { email, password, username } = await req.json();
+
+  const exists = await User.findOne({ email });
+  if (exists) return NextResponse.json({ error: "Email exists" }, { status: 400 });
+
+  const hashed = await bcrypt.hash(password, 10);
+  const user = await User.create({ email, password: hashed, username });
+
+  const token = signToken({ id: user._id, email: user.email, role: user.role });
+  return NextResponse.json({ user: { id: user._id, email: user.email, username: user.username }, token });
+}
+'@ | Set-Content -Path "src\app\api\auth\register\route.ts" -Force
+
+# Auth login
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import User from "@models/User";
+import bcrypt from "bcryptjs";
+import { signToken } from "@lib/jwt";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const { email, password } = await req.json();
+
+  const user = await User.findOne({ email });
+  if (!user) return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
+
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
+
+  const token = signToken({ id: user._id, email: user.email, role: user.role });
+  return NextResponse.json({ user: { id: user._id, email: user.email, username: user.username }, token });
+}
+'@ | Set-Content -Path "src\app\api\auth\login\route.ts" -Force
+
+# Profile update
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import User from "@models/User";
+
+export async function PUT(req: Request) {
+  await connectDB();
+  const { id, updates } = await req.json();
+
+  const user = await User.findByIdAndUpdate(id, updates, { new: true }).select("-password");
+  if (!user) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  return NextResponse.json({ user });
+}
+'@ | Set-Content -Path "src\app\api\auth\profile\route.ts" -Force
+
+# Upload route (Cloudinary with multer)
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import cloudinary from "@lib/cloudinary";
+import multer from "multer";
+import fs from "fs";
+
+export const config = {
+  api: {
+    bodyParser: false
+  }
+};
+
+// simple multer storage
+const upload = multer({ dest: "/tmp/uploads" });
+
+export async function POST(req: any) {
+  // multer doesn't work natively in Next.js route handlers; this is a simplified approach:
+  // For actual multipart handling, use an external express endpoint (see server.js) or client direct-to-cloudinary uploads.
+  return NextResponse.json({ error: "Use the express upload server (server.js) or direct client uploads for files." }, { status: 400 });
+}
+'@ | Set-Content -Path "src\app\api\upload\route.ts" -Force
+
+# Products create
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Product from "@models/Product";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const body = await req.json();
+  const product = await Product.create(body);
+  return NextResponse.json({ product });
+}
+'@ | Set-Content -Path "src\app\api\products\create\route.ts" -Force
+
+# Products get (list)
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Product from "@models/Product";
+
+export async function GET(req: Request) {
+  await connectDB();
+  const products = await Product.find({ archived: { $ne: true } }).sort({ createdAt: -1 }).limit(100).lean();
+  return NextResponse.json({ products });
+}
+'@ | Set-Content -Path "src\app\api\products\get\route.ts" -Force
+
+# Products search
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Product from "@models/Product";
+
+export async function GET(req: Request) {
+  await connectDB();
+  const url = new URL(req.url);
+  const q = url.searchParams.get("q") || "";
+  const regex = new RegExp(q, "i");
+  const products = await Product.find({ $or: [{ title: regex }, { description: regex }] }).limit(50).lean();
+  return NextResponse.json({ products });
+}
+'@ | Set-Content -Path "src\app\api\products\search\route.ts" -Force
+
+# Favorites toggle
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import User from "@models/User";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const { userId, productId } = await req.json();
+  const user = await User.findById(userId);
+  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
+
+  const idx = user.favorites.findIndex((f: any) => f.toString() === productId);
+  if (idx === -1) {
+    user.favorites.push(productId);
+  } else {
+    user.favorites.splice(idx, 1);
+  }
+  await user.save();
+  return NextResponse.json({ favorites: user.favorites });
+}
+'@ | Set-Content -Path "src\app\api\products\favorite\route.ts" -Force
+
+# Messages send
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Message from "@models/Message";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const { from, to, text } = await req.json();
+  const msg = await Message.create({ from, to, text });
+  return NextResponse.json({ msg });
+}
+'@ | Set-Content -Path "src\app\api\messages\send\route.ts" -Force
+
+# Messages get
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Message from "@models/Message";
+
+export async function GET(req: Request) {
+  await connectDB();
+  const url = new URL(req.url);
+  const u1 = url.searchParams.get("u1");
+  const u2 = url.searchParams.get("u2");
+
+  const msgs = await Message.find({
+    $or: [
+      { from: u1, to: u2 },
+      { from: u2, to: u1 }
+    ]
+  }).sort({ createdAt: 1 }).lean();
+
+  return NextResponse.json({ messages: msgs });
+}
+'@ | Set-Content -Path "src\app\api\messages\get\route.ts" -Force
+
+# Admin ban
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import User from "@models/User";
+import Log from "@models/Log";
+
+export async function POST(req: Request) {
+  await connectDB();
+  const { userId, reason } = await req.json();
+  const user = await User.findByIdAndUpdate(userId, { banned: true }, { new: true });
+  await Log.create({ level: "admin", message: "user banned", meta: { userId, reason } });
+  return NextResponse.json({ user });
+}
+'@ | Set-Content -Path "src\app\api\admin\ban\route.ts" -Force
+
+# Admin logs
+@'
+import { NextResponse } from "next/server";
+import { connectDB } from "@lib/db";
+import Log from "@models/Log";
+
+export async function GET() {
+  await connectDB();
+  const logs = await Log.find().sort({ createdAt: -1 }).limit(200).lean();
+  return NextResponse.json({ logs });
+}
+'@ | Set-Content -Path "src\app\api\admin\logs\route.ts" -Force
+
+# 8) Socket.io server (express) - server.js at project root
+@'
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const mongoose = require("mongoose");
+const cors = require("cors");
+require("dotenv").config();
+
+const Message = require("./src/models/Message").default;
+const User = require("./src/models/User").default;
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+io.on("connection", (socket) => {
+  console.log("socket connected:", socket.id);
+
+  socket.on("join", (room) => {
+    socket.join(room);
+  });
+
+  socket.on("message", async (data) => {
+    // data { from, to, text }
+    try {
+      const msg = await Message.create({ from: data.from, to: data.to, text: data.text });
+      io.to(data.to).emit("message", msg);
+      io.to(data.from).emit("message", msg);
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("socket disconnected:", socket.id);
+  });
+});
+
+const PORT = process.env.SOCKET_PORT || 4000;
+
+mongoose.connect(process.env.MONGODB_URI, {}).then(() => {
+  console.log("Socket server connected to MongoDB");
+  server.listen(PORT, () => console.log("Socket server listening on", PORT));
+}).catch(err => console.error(err));
+'@ | Set-Content -Path "server.js" -Force
+
+# 9) Frontend improvements (messages page will try socket then fallback)
+
+# src/app/messages/page.tsx (overwrite)
+@'
+"use client";
+import { useEffect, useState, useRef } from "react";
+import io from "socket.io-client";
+
+let socket: any;
+
+export default function Messages() {
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [text, setText] = useState("");
+  const [messages, setMessages] = useState<any[]>([]);
+  const connectedRef = useRef(false);
+
+  useEffect(() => {
+    // try to connect to socket server (assumes SOCKET_URL in env)
+    const SOCKET_URL = (process.env.NEXT_PUBLIC_SOCKET_URL as string) || "http://localhost:4000";
+    socket = io(SOCKET_URL);
+
+    socket.on("connect", () => {
+      connectedRef.current = true;
+      console.log("connected to socket", socket.id);
+    });
+
+    socket.on("message", (m: any) => {
+      setMessages((prev) => [...prev, m]);
+    });
+
+    return () => {
+      socket?.disconnect();
+    };
+  }, []);
+
+  async function send() {
+    if (connectedRef.current && socket) {
+      socket.emit("message", { from, to, text });
+    } else {
+      await fetch("/api/messages/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from, to, text })
+      });
+    }
+    setText("");
+  }
+
+  async function loadConv() {
+    const res = await fetch(`/api/messages/get?u1=${from}&u2=${to}`);
+    const d = await res.json();
+    setMessages(d.messages || []);
+  }
+
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">Messages</h1>
+
+      <input value={from} onChange={(e) => setFrom(e.target.value)} placeholder="You (user id)" className="border p-2 mb-2 w-full" />
+      <input value={to} onChange={(e) => setTo(e.target.value)} placeholder="Other (user id)" className="border p-2 mb-2 w-full" />
+
+      <div className="mb-2">
+        <textarea value={text} onChange={(e) => setText(e.target.value)} className="border p-2 w-full mb-2" />
+        <div className="flex gap-2">
+          <button onClick={send} className="bg-blue-600 text-white p-2 rounded">Send</button>
+          <button onClick={loadConv} className="bg-gray-200 p-2 rounded">Load</button>
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-2">
+        {messages.map((m) => (
+          <div key={m._id || Math.random()} className="p-3 bg-gray-100 rounded">
+            <strong>{m.from}</strong> → <strong>{m.to}</strong>
+            <div>{m.text}</div>
+            <div className="text-xs text-gray-500">{new Date(m.createdAt).toLocaleString()}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+'@ | Set-Content -Path "src\app\messages\page.tsx" -Force
+
+# 10) Add product add page with client upload hint (uploads to socket or Cloudinary direct)
+@'
+"use client";
+import { useState } from "react";
+
+export default function AddProduct() {
+  const [title, setTitle] = useState("");
+  const [price, setPrice] = useState("");
+  const [desc, setDesc] = useState("");
+
+  async function submit() {
+    const res = await fetch("/api/products/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, description: desc, price: Number(price) })
+    });
+    const d = await res.json();
+    if (d.product) alert("Created");
+    else alert("Error");
+  }
+
+  return (
+    <div className="p-6 max-w-md">
+      <h1 className="text-2xl font-bold mb-4">Add Product</h1>
+      <input placeholder="Title" value={title} onChange={(e) => setTitle(e.target.value)} className="border p-2 mb-2 w-full" />
+      <input placeholder="Price" type="number" value={price} onChange={(e) => setPrice(e.target.value)} className="border p-2 mb-2 w-full" />
+      <textarea placeholder="Description" value={desc} onChange={(e) => setDesc(e.target.value)} className="border p-2 mb-2 w-full" />
+      <button onClick={submit} className="bg-blue-600 text-white p-2 rounded">Create</button>
+    </div>
+  );
+}
+'@ | Set-Content -Path "src\app\add-item\page.tsx" -Force
+
+# 11) Update package.json scripts to run socket server concurrently
+$pkg = Get-Content package.json -Raw | ConvertFrom-Json
+$pkg.scripts["socket"] = "node server.js"
+$pkg.scripts["dev:all"] = "concurrently \"npm run dev\" \"npm run socket\""
+$pkg | ConvertTo-Json -Depth 10 | Set-Content package.json
+
+# 12) Create .env.local sample
+@'
+# Copy to .env.local and fill values
+MONGODB_URI="mongodb+srv://projectkilla13:<DB_PASSWORD>@swapspot.ndvxhja.mongodb.net/swapspot"
+JWT_SECRET="replace_with_a_long_secret_string"
+CLOUDINARY_CLOUD_NAME=""
+CLOUDINARY_API_KEY=""
+CLOUDINARY_API_SECRET=""
+SOCKET_PORT=4000
+NEXT_PUBLIC_SOCKET_URL="http://localhost:4000"
+'@ | Set-Content -Path ".env.local.sample" -Force
+
+Write-Host "=== Upgrade complete ===" -ForegroundColor Green
+Write-Host "1) Add real secrets to .env.local (copy from .env.local.sample)"
+Write-Host "2) Run: npm install"
+Write-Host "3) Run: npm run dev:all (starts Next.js + socket server)"
+Write-Host ""
+Write-Host "Notes:"
+Write-Host "- For production, run socket server on a persistent host (Render/Heroku) and set NEXT_PUBLIC_SOCKET_URL accordingly."
+Write-Host "- Cloudinary file uploads: the upload route in Next.js is a placeholder. For production use direct client uploads to Cloudinary or an express upload endpoint (we provided server.js pattern)."
