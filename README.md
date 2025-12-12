@@ -1,2 +1,0 @@
-# used-market-
-resale app 
